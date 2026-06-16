@@ -19,6 +19,7 @@ ray[default]
 ring_flash_attn
 safetensors
 tensorboard
+TransferQueue>=0.1.8
 transformers
 vllm-router>=0.1.14
 wandb

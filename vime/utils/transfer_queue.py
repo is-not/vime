@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 from omegaconf import OmegaConf
 
-from slime.utils.async_utils import run
+from vime.utils.async_utils import run
 
 logger = logging.getLogger(__name__)
 
