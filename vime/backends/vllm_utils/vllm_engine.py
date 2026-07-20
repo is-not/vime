@@ -74,6 +74,8 @@ def _build_subprocess_env(server_args_dict: dict[str, Any]) -> dict[str, str]:
         if vime_root not in {p for p in existing_pp.split(os.pathsep) if p}:
             env["PYTHONPATH"] = os.pathsep.join(filter(None, [vime_root, existing_pp]))
         env.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    if args.lora_rank > 0:
+        env.setdefault("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "1")
 
     worker_type = server_args_dict.get("_worker_type", "regular")
     if worker_type in ("prefill", "decode") and server_args_dict.get("node_rank", 0) == 0:
@@ -333,7 +335,12 @@ class VLLMEngine(RayActor):
     def set_weight_version(self, new_version: str):
         self._weight_version = str(new_version)
 
-    def release_memory_occupation(self, level: int = 2):
+    def release_memory_occupation(self, level: int | None = None):
+        if level is None:
+            # LoRA updates only reload the adapter, never the base weights, so
+            # sleep level 1 (offload weights) is required instead of level 2
+            # (discard weights).
+            level = 1 if self.args.lora_rank > 0 else 2
         self.flush_cache()
         response = requests.post(f"http://{self.server_host}:{self.server_port}/sleep", params={"level": level})
         response.raise_for_status()
@@ -437,6 +444,48 @@ class VLLMEngine(RayActor):
         result = self._make_request("update_weights", {"update_info": update_info})
         self._weight_version = str(weight_version)
         return result
+
+    def load_lora_adapter(self, adapter_name: str, adapter_path: str, weight_version: str | None = None):
+        """Load or replace a LoRA adapter through vLLM's runtime adapter API."""
+        if self.node_rank != 0:
+            return None
+
+        base_url = f"http://{self.server_host}:{self.server_port}"
+        # vLLM rejects loading an adapter name that is already registered, so
+        # unload first; 404 means the adapter is not loaded yet (first update).
+        response = requests.post(f"{base_url}/v1/unload_lora_adapter", json={"lora_name": adapter_name})
+        if response.status_code != 404:
+            response.raise_for_status()
+
+        response = requests.post(
+            f"{base_url}/v1/load_lora_adapter",
+            json={"lora_name": adapter_name, "lora_path": adapter_path},
+        )
+        response.raise_for_status()
+        if weight_version is not None:
+            self._weight_version = str(weight_version)
+
+    def start_lora_weight_update(self, lora_request: dict, weight_version: str | None = None):
+        """Open an in-memory LoRA update transaction on the engine (vLLM #48409).
+
+        Installs a LoRA weight-update target so the adapter tensors streamed over the
+        existing IPC channel land in the adapter instead of the base model. The engine
+        must already be paused. ``finish_weight_update`` commits and clears the target.
+        Requires a vLLM build with #48409; a 404 here means the running vLLM predates it.
+        """
+        if self.node_rank != 0:
+            return None
+        base_url = f"http://{self.server_host}:{self.server_port}"
+        response = requests.post(f"{base_url}/start_lora_weight_update", json={"lora_request": lora_request})
+        if response.status_code == 404:
+            raise RuntimeError(
+                "vLLM rejected /start_lora_weight_update (404): the running vLLM lacks LoRA "
+                "tensor-update support (#48409). Drop --lora-sync-from-tensor or upgrade vLLM."
+            )
+        response.raise_for_status()
+        if weight_version is not None:
+            self._weight_version = str(weight_version)
+        return response.json() if response.content else None
 
     def pause_generation(self):
         if self.node_rank != 0:

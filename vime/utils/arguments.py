@@ -296,6 +296,73 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                         """,
             )
             parser.add_argument(
+                "--lora-rank",
+                type=int,
+                default=0,
+                help="Enable actor LoRA training with this rank. 0 disables LoRA.",
+            )
+            parser.add_argument(
+                "--lora-alpha",
+                type=int,
+                default=16,
+                help="LoRA alpha used by Megatron-Bridge PEFT layers.",
+            )
+            parser.add_argument(
+                "--lora-dropout",
+                type=float,
+                default=0.0,
+                help="LoRA dropout used by Megatron-Bridge PEFT layers.",
+            )
+            parser.add_argument(
+                "--lora-type",
+                type=str,
+                choices=["lora", "canonical_lora"],
+                default="lora",
+                help="Megatron-Bridge LoRA implementation to use.",
+            )
+            parser.add_argument(
+                "--target-modules",
+                type=str,
+                nargs="*",
+                default=["all-linear"],
+                help=(
+                    "LoRA target modules. Supports HF names (q_proj,o_proj,...) or Megatron names "
+                    "(linear_qkv,linear_proj,linear_fc1,linear_fc2). Use all-linear for the default projections."
+                ),
+            )
+            parser.add_argument(
+                "--exclude-modules",
+                type=str,
+                nargs="*",
+                default=None,
+                help="Optional LoRA modules to exclude from --target-modules.",
+            )
+            parser.add_argument(
+                "--lora-adapter-name",
+                type=str,
+                default="vime_lora",
+                help="Adapter name used when loading the runtime LoRA adapter into vLLM.",
+            )
+            parser.add_argument(
+                "--lora-adapter-path",
+                type=str,
+                default=None,
+                help=(
+                    "Resume from a saved LoRA adapter checkpoint (an `iter_*/adapter` directory). "
+                    "Base weights still come from --load; this overlays the adapter and optimizer state."
+                ),
+            )
+            parser.add_argument(
+                "--lora-sync-from-tensor",
+                action="store_true",
+                default=False,
+                help=(
+                    "Stream the LoRA adapter to colocated vLLM over IPC instead of writing it to "
+                    "disk and reloading. Requires a vLLM build with LoRA tensor updates (#48409); "
+                    "the first sync still registers the adapter from disk."
+                ),
+            )
+            parser.add_argument(
                 "--allgather-cp",
                 action="store_true",
                 default=False,
@@ -1748,6 +1815,39 @@ def _validate_update_weight_args(args) -> None:
 
 def vime_validate_args(args):
     args.eval_datasets = _resolve_eval_datasets(args)
+
+    if args.lora_rank < 0:
+        raise ValueError("--lora-rank must be non-negative.")
+
+    if getattr(args, "lora_adapter_path", None) is not None and args.lora_rank == 0:
+        raise ValueError("--lora-adapter-path requires --lora-rank > 0; without it the model has no adapter to load.")
+
+    if args.lora_rank > 0:
+        from vime.backends.megatron_utils.lora_utils import normalize_target_modules
+
+        if args.megatron_to_hf_mode != "bridge":
+            raise ValueError("--lora-rank requires --megatron-to-hf-mode bridge.")
+        if not args.colocate:
+            raise ValueError("--lora-rank currently requires colocated vLLM rollout (--colocate).")
+        if args.custom_model_provider_path is not None:
+            raise ValueError("--lora-rank is only supported by the built-in Bridge model provider.")
+        args.target_modules = normalize_target_modules(args.target_modules, args.exclude_modules)
+        if not args.target_modules:
+            raise ValueError("--target-modules is empty after applying --exclude-modules.")
+        # The vllm_* args are introspected from the installed vLLM version, so
+        # their presence is genuinely version-dependent.
+        if hasattr(args, "vllm_enable_lora"):
+            args.vllm_enable_lora = True
+        if hasattr(args, "vllm_max_lora_rank"):
+            args.vllm_max_lora_rank = max(int(args.vllm_max_lora_rank or 0), int(args.lora_rank))
+        if hasattr(args, "vllm_max_loras"):
+            args.vllm_max_loras = max(int(args.vllm_max_loras or 0), 1)
+
+    if getattr(args, "lora_sync_from_tensor", False):
+        if args.lora_rank == 0:
+            raise ValueError("--lora-sync-from-tensor requires LoRA training (--lora-rank > 0).")
+        if not args.colocate:
+            raise ValueError("--lora-sync-from-tensor requires colocated vLLM rollout (--colocate).")
 
     if args.kl_coef != 0 or args.use_kl_loss:
         if not os.path.exists(args.ref_load):

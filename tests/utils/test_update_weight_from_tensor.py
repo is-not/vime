@@ -143,6 +143,7 @@ def _default_args(**kwargs) -> Namespace:
         rollout_num_gpus_per_engine=2,
         megatron_to_hf_mode="raw",
         update_weight_buffer_size=1 << 30,
+        lora_rank=0,
         enable_mtp_training=False,
         vllm_speculative_config=None,
     )

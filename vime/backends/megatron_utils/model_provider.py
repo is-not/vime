@@ -17,7 +17,7 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
-from vime.utils.megatron_bridge_utils import patch_auto_bridge_hf_config
+from vime.utils.megatron_bridge_utils import patch_auto_bridge_hf_config, patch_bridge_grouped_lora_te_fastpath
 from vime.utils.misc import load_function
 
 
@@ -163,10 +163,18 @@ def _get_model_provider_func(
 
         import vime_plugins.megatron_bridge  # noqa: F401  # register custom bridges
 
+        patch_bridge_grouped_lora_te_fastpath()
         bridge = patch_auto_bridge_hf_config(AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True))
         provider = bridge.to_megatron_provider(load_weights=False)
         _apply_bridge_runtime_config(provider, args)
         provider.finalize()
+
+        lora = None
+        if role == "actor":
+            from .lora_utils import create_lora_instance, is_lora_enabled
+
+            if is_lora_enabled(args):
+                lora = create_lora_instance(args)
 
         def wrapped_bridge_provider(
             pre_process: bool = True,
@@ -186,6 +194,9 @@ def _get_model_provider_func(
             if pg_collection is not None:
                 provider._pg_collection = pg_collection
             model = provider.provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+            if lora is not None:
+                model = lora(model, training=True)
+                lora.set_params_to_save(model)
             if post_process and role == "critic":
                 model.output_layer = LinearForLastLayer(
                     input_size=model.config.hidden_size, output_size=1, config=model.config
