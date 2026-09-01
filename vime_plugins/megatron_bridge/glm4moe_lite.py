@@ -14,25 +14,16 @@ import logging
 from functools import partial
 
 import torch
+from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
+from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
+from megatron.bridge.models.conversion.param_mapping import AutoMapping, GatedMLPMapping
+from megatron.bridge.models.glm.glm45_bridge import GLM45Bridge
+from megatron.bridge.models.glm.glm_moe_mappings import GLMExpertDownProjMapping, GLMExpertGateUpProjMapping
+from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
+from megatron.bridge.models.mla_provider import MLAModelProvider
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from transformers import Glm4MoeLiteForCausalLM
-
-from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
-from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
-from megatron.bridge.models.conversion.param_mapping import (
-    AutoMapping,
-    GatedMLPMapping,
-    QKVMapping,
-)
-from megatron.bridge.models.glm.glm45_bridge import GLM45Bridge
-from megatron.bridge.models.glm.glm_moe_mappings import (
-    GLMExpertDownProjMapping,
-    GLMExpertGateUpProjMapping,
-)
-from megatron.bridge.models.gpt_provider import GPTModelProvider
-from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
-from megatron.bridge.models.mla_provider import MLAModelProvider
 
 try:
     import transformer_engine  # noqa: F401
@@ -61,17 +52,10 @@ class GLM47MTPBridge(GLM45Bridge):
     """
 
     def provider_bridge(self, hf_pretrained: PreTrainedCausalLM):
-        """Convert HuggingFace config to MLAModelProvider (MLA detection)."""
+        """Convert HuggingFace config to MLAModelProvider."""
         provider_kwargs = self.hf_config_to_provider_kwargs(hf_pretrained.config)
         mla_rope = provider_kwargs.pop("_mla_rope_params", None)
-        # Detect MLA model (e.g. GLM-4.7-Flash with q_lora_rank)
-        is_mla = "q_lora_rank" in provider_kwargs
-        if is_mla:
-            provider_class = self.PROVIDER_CLASS if self.PROVIDER_CLASS is not None else MLAModelProvider
-        else:
-            for key in ["q_lora_rank", "kv_lora_rank", "qk_head_dim", "qk_pos_emb_head_dim", "v_head_dim"]:
-                provider_kwargs.pop(key, None)
-            provider_class = self.PROVIDER_CLASS if self.PROVIDER_CLASS is not None else GPTModelProvider
+        provider_class = self.PROVIDER_CLASS if self.PROVIDER_CLASS is not None else MLAModelProvider
         provider = provider_class(**provider_kwargs)
 
         # Set rope type
@@ -83,7 +67,7 @@ class GLM47MTPBridge(GLM45Bridge):
             provider.position_embedding_type = "rope"
 
         # Match vLLM defaults (no scaling, mscale=1.0) when HF config has no explicit rope params.
-        if not mla_rope and is_mla:
+        if not mla_rope:
             mla_rope = {"rotary_scaling_factor": 1.0, "mscale_all_dim": 1.0}
 
         if mla_rope:
@@ -97,14 +81,13 @@ class GLM47MTPBridge(GLM45Bridge):
         provider.gated_linear_unit = True
         provider.add_bias_linear = False
         provider.share_embeddings_and_output_weights = False
-        if is_mla:
-            provider.multi_latent_attention = True
-            provider.qk_layernorm = True
+        provider.multi_latent_attention = True
+        provider.qk_layernorm = True
 
         provider.moe_shared_expert_overlap = True
         provider.moe_token_dispatcher_type = "alltoall"
         provider.moe_router_load_balancing_type = "seq_aux_loss"
-        provider.moe_router_pre_softmax = False
+        provider.moe_router_pre_softmax = True
         provider.moe_grouped_gemm = True
         provider.moe_router_score_function = "sigmoid"
         provider.moe_permute_fusion = True
@@ -148,7 +131,7 @@ class GLM47MTPBridge(GLM45Bridge):
             "decoder.layers.*.input_layernorm.weight": "model.layers.*.input_layernorm.weight",
             "decoder.layers.*.self_attention.linear_proj.weight": "model.layers.*.self_attn.o_proj.weight",
             "decoder.layers.*.pre_mlp_layernorm.weight": "model.layers.*.post_attention_layernorm.weight",
-            "decoder.layers.*.self_attention.q_layernorm.weight": "model.layers.*.self_attn.q_norm.weight",
+            "decoder.layers.*.self_attention.q_layernorm.weight": "model.layers.*.self_attn.q_a_layernorm.weight",
             "decoder.layers.*.self_attention.k_layernorm.weight": "model.layers.*.self_attn.k_norm.weight",
             # MLA-specific layernorm
             "decoder.layers.*.self_attention.kv_layernorm.weight": "model.layers.*.self_attn.kv_a_layernorm.weight",
@@ -163,15 +146,6 @@ class GLM47MTPBridge(GLM45Bridge):
 
         for megatron_param, hf_param in param_mappings.items():
             mapping_list.append(AutoMapping(megatron_param=megatron_param, hf_param=hf_param))
-
-        # Detect MLA model (e.g. GLM-4.7-Flash) for conditional mapping
-        is_mla_mapping = hasattr(self, "_hf_config") and hasattr(self._hf_config, "q_lora_rank")
-
-        # For MLA models, override q_layernorm mapping from q_norm to q_a_layernorm
-        if is_mla_mapping:
-            layer_specific_mappings[
-                "decoder.layers.*.self_attention.q_layernorm.weight"
-            ] = "model.layers.*.self_attn.q_a_layernorm.weight"
 
         for megatron_param, hf_param in layer_specific_mappings.items():
             mapping_list.append(AutoMapping(megatron_param=megatron_param, hf_param=hf_param))
@@ -282,58 +256,37 @@ class GLM47MTPBridge(GLM45Bridge):
                     ),
                 ]
             )
-            # Special mappings that require parameter concatenation/transformation
-            if is_mla_mapping:
-                # MLA models (e.g. GLM-4.7-Flash): MTP transformer layer reuses the
-                # last normal layer spec (MLA), so map the individual Q/KV down/up
-                # projections instead of a fused QKV.
-                mapping_list.extend(
-                    [
-                        AutoMapping(
-                            megatron_param=f"mtp.layers.{mtp_layer}.transformer_layer.self_attention.linear_q_down_proj.weight",
-                            hf_param=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.q_a_proj.weight",
-                        ),
-                        AutoMapping(
-                            megatron_param=f"mtp.layers.{mtp_layer}.transformer_layer.self_attention.linear_q_up_proj.weight",
-                            hf_param=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.q_b_proj.weight",
-                        ),
-                        AutoMapping(
-                            megatron_param=f"mtp.layers.{mtp_layer}.transformer_layer.self_attention.linear_kv_down_proj.weight",
-                            hf_param=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.kv_a_proj_with_mqa.weight",
-                        ),
-                        AutoMapping(
-                            megatron_param=f"mtp.layers.{mtp_layer}.transformer_layer.self_attention.linear_kv_up_proj.weight",
-                            hf_param=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.kv_b_proj.weight",
-                        ),
-                        AutoMapping(
-                            megatron_param=f"mtp.layers.{mtp_layer}.transformer_layer.self_attention.linear_q_up_proj.layer_norm_weight",
-                            hf_param=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.q_a_layernorm.weight",
-                        ),
-                        AutoMapping(
-                            megatron_param=f"mtp.layers.{mtp_layer}.transformer_layer.self_attention.linear_kv_up_proj.layer_norm_weight",
-                            hf_param=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.kv_a_layernorm.weight",
-                        ),
-                    ]
-                )
-            else:
-                # Non-MLA models (GLM-4.5): fused QKV projection
-                mapping_list.extend(
-                    [
-                        QKVMapping(
-                            megatron_param=f"mtp.layers.{mtp_layer}.transformer_layer.self_attention.linear_qkv.weight",
-                            q=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.q_proj.weight",
-                            k=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.k_proj.weight",
-                            v=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.v_proj.weight",
-                        ),
-                        QKVMapping(
-                            megatron_param=f"mtp.layers.{mtp_layer}.transformer_layer.self_attention.linear_qkv.bias",
-                            q=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.q_proj.bias",
-                            k=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.k_proj.bias",
-                            v=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.v_proj.bias",
-                        ),
-                    ]
-                )
-            # MTP transformer layer MLP mappings (shared by both MLA and non-MLA)
+            # MTP transformer layer reuses the last normal layer spec (MLA), so map
+            # the individual Q/KV down/up projections instead of a fused QKV.
+            mapping_list.extend(
+                [
+                    AutoMapping(
+                        megatron_param=f"mtp.layers.{mtp_layer}.transformer_layer.self_attention.linear_q_down_proj.weight",
+                        hf_param=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.q_a_proj.weight",
+                    ),
+                    AutoMapping(
+                        megatron_param=f"mtp.layers.{mtp_layer}.transformer_layer.self_attention.linear_q_up_proj.weight",
+                        hf_param=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.q_b_proj.weight",
+                    ),
+                    AutoMapping(
+                        megatron_param=f"mtp.layers.{mtp_layer}.transformer_layer.self_attention.linear_kv_down_proj.weight",
+                        hf_param=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.kv_a_proj_with_mqa.weight",
+                    ),
+                    AutoMapping(
+                        megatron_param=f"mtp.layers.{mtp_layer}.transformer_layer.self_attention.linear_kv_up_proj.weight",
+                        hf_param=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.kv_b_proj.weight",
+                    ),
+                    AutoMapping(
+                        megatron_param=f"mtp.layers.{mtp_layer}.transformer_layer.self_attention.linear_q_up_proj.layer_norm_weight",
+                        hf_param=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.q_a_layernorm.weight",
+                    ),
+                    AutoMapping(
+                        megatron_param=f"mtp.layers.{mtp_layer}.transformer_layer.self_attention.linear_kv_up_proj.layer_norm_weight",
+                        hf_param=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.kv_a_layernorm.weight",
+                    ),
+                ]
+            )
+            # MTP transformer layer MLP mappings
             mapping_list.extend(
                 [
                     GatedMLPMapping(

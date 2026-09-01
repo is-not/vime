@@ -6,10 +6,11 @@ pkill -9 -f VLLM
 sleep 3
 ray stop --force
 pkill -9 ray
+pkill -9 python
 sleep 3
 pkill -9 ray
-pkill -9 redis-server
 pkill -9 python
+pkill -9 redis
 
 set -ex
 
@@ -24,6 +25,12 @@ export DISABLE_L2_CACHE=1
 export VLLM_ASCEND_ENABLE_NZ=0
 export VLLM_USE_AOT_COMPILE=0
 export PYTHONPATH="/root/Megatron-Bridge/src:/root/Megatron-LM/:${PYTHONPATH:-}"
+
+# Apply the vLLMWorkerExtension monkey-patch that makes the GLM-4.7 MTP drafter
+# forward cudagraph-friendly on NPU (torch.where instead of bool-mask index,
+# which otherwise fails aclnnNonzeroV2 under cudagraph capture).
+# Drop this once vLLM upstream fixes the graph-safety issue.
+export VIME_PATCH_GLM_MTP_GRAPH=1
 
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 
@@ -80,6 +87,11 @@ PERF_ARGS=(
    --seq-length 24576
 )
 
+MTP_ARGS=(
+   --mtp-num-layers 1
+   --enable-mtp-training
+   --mtp-loss-scaling-factor 0.2
+)
 
 GRPO_ARGS=(
    --advantage-estimator grpo
@@ -108,6 +120,7 @@ VLLM_ARGS=(
    --rollout-num-gpus-per-engine 4
    --vllm-gpu-memory-utilization 0.7
    --vllm-cudagraph-capture-sizes 1 2 4 8 $(seq 16 8 256)
+   --vllm-speculative-config '{"method":"mtp","num_speculative_tokens":1}'
 )
 
 MISC_ARGS=(
@@ -123,20 +136,20 @@ MISC_ARGS=(
 
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 16 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+ray start --head --node-ip-address ${MASTER_ADDR} --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 ray job submit --address="http://127.0.0.1:8265" \
    -- python3 train.py \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node 8 \
    --rollout-num-gpus 8 \
-   ${MODEL_ARGS[@]} \
-   ${CKPT_ARGS[@]} \
-   ${ROLLOUT_ARGS[@]} \
-   ${OPTIMIZER_ARGS[@]} \
-   ${GRPO_ARGS[@]} \
-   ${PERF_ARGS[@]} \
-   ${EVAL_ARGS[@]} \
-   ${VLLM_ARGS[@]} \
-   ${MISC_ARGS[@]} \
-   ${MTP_ARGS[@]}
+   "${MODEL_ARGS[@]}" \
+   "${CKPT_ARGS[@]}" \
+   "${ROLLOUT_ARGS[@]}" \
+   "${OPTIMIZER_ARGS[@]}" \
+   "${GRPO_ARGS[@]}" \
+   "${PERF_ARGS[@]}" \
+   "${EVAL_ARGS[@]}" \
+   "${VLLM_ARGS[@]}" \
+   "${MISC_ARGS[@]}" \
+   "${MTP_ARGS[@]}"
