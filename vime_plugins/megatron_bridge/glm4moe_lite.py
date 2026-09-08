@@ -112,6 +112,65 @@ class GLM47MTPBridge(GLM45Bridge):
 
         return provider
 
+    def _glm_hf_config(self):
+        """Return the HF config across bridge revisions.
+
+        Newer bridge revisions stash the config on ``self._hf_config`` inside
+        ``build_conversion_tasks``; older revisions only expose the
+        ``self.hf_config`` property (set during ``build_conversion_tasks`` on
+        the base class). The peft adapter path calls ``mapping_registry``
+        *before* either attribute is populated, so guard both.
+        """
+        hf_config = getattr(self, "_hf_config", None)
+        if hf_config is None:
+            hf_config = getattr(self, "hf_config", None)
+        return hf_config
+
+    def _glm_hf_keys(self):
+        """Return the HF state keys in a revision-safe way.
+
+        Newer bridge revisions cache keys on ``self._hf_keys``; older ones
+        reach them through ``self.hf_pretrained.state.source``. The latter
+        raises ``AttributeError`` on config-only paths (peft adapter export),
+        so fall back to ``None`` instead of propagating.
+        """
+        hf_keys = getattr(self, "_hf_keys", None)
+        if hf_keys:
+            return hf_keys
+        try:
+            source = self.hf_pretrained.state.source
+        except AttributeError:
+            return None
+        return list(source.get_all_keys()) if source is not None else None
+
+    def _uses_fused_experts(self) -> bool:
+        """Determine whether expert weights are fused (gate_up_proj/down_proj).
+
+        GLM-4.7-Flash ships fused expert tensors by default. We mirror the
+        base bridge's key-based detection when the HF state is available, and
+        fall back to ``True`` (the documented GLM HuggingFace default) on the
+        config-only peft adapter path where no HF weights are present.
+        """
+        hf_keys = self._glm_hf_keys()
+        if hf_keys:
+            if any("mlp.experts.gate_up_proj" in key for key in hf_keys) or any(
+                "mlp.experts.down_proj" in key for key in hf_keys
+            ):
+                return True
+        # Config-only path: GLM HuggingFace models always use fused expert
+        # weights (gate_up_proj / down_proj), so default True.
+        return True
+
+    def _hf_expert_suffix(self, base_name: str) -> str:
+        """Resolve the expert tensor suffix (``.weight`` or ``""``) safely."""
+        hf_keys = self._glm_hf_keys()
+        if hf_keys:
+            if any(f"{base_name}.weight" in key for key in hf_keys):
+                return ".weight"
+            return ""
+        # Config-only path: GLM fused expert tensors have no .weight suffix.
+        return ""
+
     def mapping_registry(self) -> MegatronMappingRegistry:
         mapping_list = []
         use_fused_experts = self._uses_fused_experts()
@@ -219,10 +278,10 @@ class GLM47MTPBridge(GLM45Bridge):
                 ]
             )
         # optionally add MTP mappings
-        if not hasattr(self, "_hf_config"):
+        hf_config = self._glm_hf_config()
+        if hf_config is None:
             logger.warning("No HF config found, skipping MTP mappings.")
             return MegatronMappingRegistry(*mapping_list)
-        hf_config = self._hf_config
         num_mtp_layers = getattr(hf_config, "num_nextn_predict_layers", 0)
         num_transformer_layers = hf_config.num_hidden_layers
         for mtp_layer in range(num_mtp_layers):
