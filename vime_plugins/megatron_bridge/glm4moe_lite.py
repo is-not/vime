@@ -146,10 +146,10 @@ class GLM47MTPBridge(GLM45Bridge):
     def _uses_fused_experts(self) -> bool:
         """Determine whether expert weights are fused (gate_up_proj/down_proj).
 
-        GLM-4.7-Flash ships fused expert tensors by default. We mirror the
-        base bridge's key-based detection when the HF state is available, and
-        fall back to ``True`` (the documented GLM HuggingFace default) on the
-        config-only peft adapter path where no HF weights are present.
+        Detection follows the base bridge's key inspection when the HF state
+        is available. GLM-4.7-Flash HuggingFace checkpoints ship per-expert
+        weights (``experts.<n>.gate_proj`` / ``up_proj`` / ``down_proj``),
+        not fused tensors, so the config-only fallback returns ``False``.
         """
         hf_keys = self._glm_hf_keys()
         if hf_keys:
@@ -157,9 +157,9 @@ class GLM47MTPBridge(GLM45Bridge):
                 "mlp.experts.down_proj" in key for key in hf_keys
             ):
                 return True
-        # Config-only path: GLM HuggingFace models always use fused expert
-        # weights (gate_up_proj / down_proj), so default True.
-        return True
+            return False
+        # Config-only path: GLM-4.7-Flash uses per-expert (non-fused) weights.
+        return False
 
     def _hf_expert_suffix(self, base_name: str) -> str:
         """Resolve the expert tensor suffix (``.weight`` or ``""``) safely."""
