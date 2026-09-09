@@ -117,7 +117,6 @@ def execute():
         "--actor-num-gpus-per-node 8 "
         "--rollout-num-gpus 8 "
         "--ci-test "
-        "--colocate "
     )
 
     train_args = (
