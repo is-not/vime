@@ -89,8 +89,8 @@ def execute():
         "--use-precision-aware-optimizer "
     )
 
-    # MTP speculative decoding under cudagraph - exercises the
-    # VIME_PATCH_GLM_MTP_GRAPH monkey-patch in update_weight_from_tensor.py.
+    # MTP speculative decoding under cudagraph - exercises the GLM-4.7 MTP
+    # drafter's graph-friendly forward (patched via docker/npu_patch/vllm.patch).
     mtp_args = "--mtp-num-layers 1 " "--enable-mtp-training " "--mtp-loss-scaling-factor 0.2 "
 
     vllm_args = (
@@ -141,9 +141,6 @@ def execute():
         extra_env_vars={
             "DISABLE_L2_CACHE": "1",
             "VLLM_USE_AOT_COMPILE": "0",
-            # Apply the GLM-4.7 MTP cudagraph-friendly monkey-patch (see
-            # update_weight_from_tensor._patch_glm_mtp_graph_friendly).
-            "VIME_PATCH_GLM_MTP_GRAPH": "1",
         },
     )
 

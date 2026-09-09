@@ -26,12 +26,6 @@ export VLLM_ASCEND_ENABLE_NZ=0
 export VLLM_USE_AOT_COMPILE=0
 export PYTHONPATH="/root/Megatron-Bridge/src:/root/Megatron-LM/:${PYTHONPATH:-}"
 
-# Apply the vLLMWorkerExtension monkey-patch that makes the GLM-4.7 MTP drafter
-# forward cudagraph-friendly on NPU (torch.where instead of bool-mask index,
-# which otherwise fails aclnnNonzeroV2 under cudagraph capture).
-# Drop this once vLLM upstream fixes the graph-safety issue.
-export VIME_PATCH_GLM_MTP_GRAPH=1
-
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
